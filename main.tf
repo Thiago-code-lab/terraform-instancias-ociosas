@@ -12,17 +12,26 @@ provider "aws" {
 }
 
 # ==========================================
-# 1. Security Group (Liberar Porta 80 para o Nginx)
+# 1. Security Group
 # ==========================================
 resource "aws_security_group" "web_sg" {
   name        = "docker-web-sg"
-  description = "Permite trafego HTTP de entrada"
+  description = "Permite trafego HTTP e SSH"
 
   ingress {
+    description = "HTTP"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"] # Restrinja ao seu IP em producao
   }
 
   egress {
@@ -31,10 +40,12 @@ resource "aws_security_group" "web_sg" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = { Name = "docker-web-sg" }
 }
 
 # ==========================================
-# 2. Instância EC2 com Docker (User Data)
+# 2. AMI Amazon Linux 2023
 # ==========================================
 data "aws_ami" "amazon_linux" {
   most_recent = true
@@ -45,123 +56,222 @@ data "aws_ami" "amazon_linux" {
   }
 }
 
+# ==========================================
+# 3. Busca automatica do tipo free tier elegivel
+# ==========================================
+data "aws_ec2_instance_types" "free_tier" {
+  filter {
+    name   = "free-tier-eligible"
+    values = ["true"]
+  }
+}
+
+locals {
+  # Prefere t2.micro, senao usa o primeiro elegivel encontrado
+  free_tier_type = contains(
+    data.aws_ec2_instance_types.free_tier.instance_types, "t2.micro"
+  ) ? "t2.micro" : tolist(data.aws_ec2_instance_types.free_tier.instance_types)[0]
+}
+
+# ==========================================
+# 4. Instancia EC2 (tipo detectado automaticamente)
+# ==========================================
 resource "aws_instance" "docker_server" {
   ami           = data.aws_ami.amazon_linux.id
-  instance_type = "t3.micro"
+  instance_type = local.free_tier_type
 
-  vpc_security_group_ids = [aws_security_group.web_sg.id]
+  vpc_security_group_ids      = [aws_security_group.web_sg.id]
+  user_data_replace_on_change = true
+
+  root_block_device {
+    volume_type = "gp3"
+    volume_size = 8
+  }
 
   user_data = <<-EOF
-              #!/bin/bash
-              dnf update -y
-              dnf install -y docker
-              systemctl start docker
-              systemctl enable docker
-              usermod -aG docker ec2-user
-              docker run -d -p 80:80 --name meu-site nginx
-              EOF
+    #!/bin/bash
+    set -euo pipefail
+    exec > /var/log/user-data.log 2>&1
 
-  tags = {
-    Name = "EC2-Docker-Agendado"
-  }
+    echo "==> Atualizando sistema..."
+    dnf update -y
+
+    echo "==> Instalando Docker..."
+    dnf install -y docker
+    systemctl start docker
+    systemctl enable docker
+    usermod -aG docker ec2-user
+
+    echo "==> Instalando Docker Compose..."
+    COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest \
+      | grep '"tag_name"' | cut -d'"' -f4)
+    curl -SL "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+      -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+
+    echo "==> Criando aplicacao..."
+    mkdir -p /app/html
+
+    cat > /app/html/index.html <<'HTML'
+    <!DOCTYPE html>
+    <html lang="pt-br">
+      <head><meta charset="UTF-8"><title>Free Tier Test</title></head>
+      <body>
+        <h1>Funcionando no Free Tier!</h1>
+        <p>Docker + Nginx rodando na EC2 t2.micro</p>
+      </body>
+    </html>
+    HTML
+
+    cat > /app/docker-compose.yml <<'COMPOSE'
+    version: '3.8'
+    services:
+      nginx:
+        image: nginx:alpine
+        container_name: meu-site
+        ports:
+          - "80:80"
+        volumes:
+          - ./html:/usr/share/nginx/html:ro
+        restart: always
+    COMPOSE
+
+    echo "==> Subindo containers..."
+    cd /app && /usr/local/bin/docker-compose up -d
+
+    cat > /etc/systemd/system/docker-app.service <<'SERVICE'
+    [Unit]
+    Description=Docker Compose App
+    Requires=docker.service
+    After=docker.service network-online.target
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    WorkingDirectory=/app
+    ExecStart=/usr/local/bin/docker-compose up -d
+    ExecStop=/usr/local/bin/docker-compose down
+    TimeoutStartSec=120
+
+    [Install]
+    WantedBy=multi-user.target
+    SERVICE
+
+    systemctl daemon-reload
+    systemctl enable docker-app.service
+
+    echo "==> Tudo pronto!"
+  EOF
+
+  tags = { Name = "EC2-Docker-FreeTier" }
 }
 
 # ==========================================
-# 3. IP Fixo (Elastic IP)
+# 4. Elastic IP
+#
+# FREE TIER ATENCAO:
+# Gratuito enquanto associado a instancia RODANDO.
+# Quando a instancia esta PARADA: ~$0.005/hora.
+# Estimativa com os agendamentos abaixo: ~$0.59/mes.
+#
+# Se quiser custo zero: remova este recurso e
+# use o output "ip_dinamico" (IP muda a cada religar).
 # ==========================================
 resource "aws_eip" "ip_fixo" {
-  instance = aws_instance.docker_server.id
-  domain   = "vpc"
-
-  tags = {
-    Name = "IP-Fixo-Docker"
-  }
+  instance   = aws_instance.docker_server.id
+  domain     = "vpc"
+  depends_on = [aws_instance.docker_server]
+  tags       = { Name = "IP-Fixo-Docker" }
 }
 
 # ==========================================
-# 4. IAM Role para o EventBridge (Permissão para Ligar/Desligar)
+# 5. IAM Role para EventBridge Scheduler
 # ==========================================
-resource "aws_iam_role" "eventbridge_ssm_role" {
-  name = "EventBridgeSSMEC2Role"
+resource "aws_iam_role" "scheduler_role" {
+  name = "EventBridgeSchedulerEC2Role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Action    = "sts:AssumeRole"
       Effect    = "Allow"
-      Principal = { Service = "events.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+      Principal = { Service = "scheduler.amazonaws.com" }
     }]
   })
 }
 
-resource "aws_iam_role_policy" "eventbridge_ssm_policy" {
-  name = "EventBridgeSSMEC2Policy"
-  role = aws_iam_role.eventbridge_ssm_role.id
+resource "aws_iam_role_policy" "scheduler_policy" {
+  name = "EventBridgeSchedulerEC2Policy"
+  role = aws_iam_role.scheduler_role.id
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = ["ssm:StartAutomationExecution"]
-        Resource = [
-          "arn:aws:ssm:us-east-1::automation-definition/AWS-StopEC2Instance",
-          "arn:aws:ssm:us-east-1::automation-definition/AWS-StartEC2Instance"
-        ]
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["ec2:StopInstances", "ec2:StartInstances", "ec2:DescribeInstanceStatus"]
-        Resource = [aws_instance.docker_server.arn]
-      }
-    ]
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ec2:StopInstances", "ec2:StartInstances"]
+      Resource = [aws_instance.docker_server.arn]
+    }]
   })
 }
 
 # ==========================================
-# 5. Agendamento - Desligar às 16:50 BRT (19:50 UTC)
+# 6. Desligar - 22:00 BRT, Seg a Sex
 # ==========================================
-resource "aws_cloudwatch_event_rule" "stop_ec2_rule" {
-  name                = "stop-docker-ec2"
-  description         = "Desliga a instancia as 16h50 (BRT)"
-  schedule_expression = "cron(50 19 * * ? *)"
-}
+resource "aws_scheduler_schedule" "stop_ec2" {
+  name        = "stop-docker-ec2-22h"
+  description = "Desliga as 22:00 BRT de segunda a sexta"
 
-resource "aws_cloudwatch_event_target" "stop_ec2_target" {
-  rule      = aws_cloudwatch_event_rule.stop_ec2_rule.name
-  target_id = "StopEC2"
-  arn       = "arn:aws:ssm:us-east-1::automation-definition/AWS-StopEC2Instance"
-  role_arn  = aws_iam_role.eventbridge_ssm_role.arn
+  flexible_time_window { mode = "OFF" }
 
-  input = jsonencode({
-    InstanceId = [aws_instance.docker_server.id]
-  })
-}
+  schedule_expression          = "cron(0 22 ? * MON-FRI *)"
+  schedule_expression_timezone = "America/Sao_Paulo"
 
-# ==========================================
-# 6. Agendamento - Ligar às 16:55 BRT (19:55 UTC)
-# ==========================================
-resource "aws_cloudwatch_event_rule" "start_ec2_rule" {
-  name                = "start-docker-ec2"
-  description         = "Liga a instancia as 16h55 (BRT)"
-  schedule_expression = "cron(55 19 * * ? *)"
-}
-
-resource "aws_cloudwatch_event_target" "start_ec2_target" {
-  rule      = aws_cloudwatch_event_rule.start_ec2_rule.name
-  target_id = "StartEC2"
-  arn       = "arn:aws:ssm:us-east-1::automation-definition/AWS-StartEC2Instance"
-  role_arn  = aws_iam_role.eventbridge_ssm_role.arn
-
-  input = jsonencode({
-    InstanceId = [aws_instance.docker_server.id]
-  })
+  target {
+    arn      = "arn:aws:scheduler:::aws-sdk:ec2:stopInstances"
+    role_arn = aws_iam_role.scheduler_role.arn
+    input    = jsonencode({ InstanceIds = [aws_instance.docker_server.id] })
+  }
 }
 
 # ==========================================
-# 7. Outputs
+# 7. Ligar - 06:00 BRT, Seg a Sex
+# Sexta 22h desliga, sabado/domingo sem schedule
+# de start, segunda 06h religa automaticamente.
+# ==========================================
+resource "aws_scheduler_schedule" "start_ec2" {
+  name        = "start-docker-ec2-6h"
+  description = "Liga as 06:00 BRT de segunda a sexta"
+
+  flexible_time_window { mode = "OFF" }
+
+  schedule_expression          = "cron(0 6 ? * MON-FRI *)"
+  schedule_expression_timezone = "America/Sao_Paulo"
+
+  target {
+    arn      = "arn:aws:scheduler:::aws-sdk:ec2:startInstances"
+    role_arn = aws_iam_role.scheduler_role.arn
+    input    = jsonencode({ InstanceIds = [aws_instance.docker_server.id] })
+  }
+}
+
+# ==========================================
+# 8. Outputs
 # ==========================================
 output "ip_publico_do_site" {
   value       = aws_eip.ip_fixo.public_ip
-  description = "Acesse este IP no navegador para ver o Nginx rodando"
+  description = "IP fixo — use para DNS. Nunca muda com stop/start."
+}
+
+output "ip_dinamico" {
+  value       = aws_instance.docker_server.public_ip
+  description = "IP direto da instancia (muda a cada religar — evite usar)"
+}
+
+output "instance_id" {
+  value = aws_instance.docker_server.id
+}
+
+output "verificar_logs" {
+  value       = "ssh -i SUA_CHAVE.pem ec2-user@${aws_eip.ip_fixo.public_ip} 'sudo cat /var/log/user-data.log'"
+  description = "Comando para checar se o user-data rodou corretamente"
 }
